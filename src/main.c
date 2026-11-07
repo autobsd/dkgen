@@ -2,13 +2,15 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
-#include <stddef.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/core_names.h>
 #include <openssl/params.h>
 #include <openssl/crypto.h>
 #include <openssl/bio.h>
+#include <openssl/ec.h>
+#include <openssl/bn.h>
+#include <openssl/param_build.h>
 
 #define MAX_LINE_LEN 512
 #define SEED_LEN     32
@@ -18,6 +20,11 @@
  * directly as the Ed25519 seed. If SEED_LEN ever changes, this build breaks
  * rather than silently producing a mismatched key. */
 _Static_assert(SEED_LEN == 32, "Ed25519 raw private key must be 32 bytes");
+
+
+/* P-256 private scalar length (32 bytes). Public key uncompressed length is 65. */
+#define P256_PRIV_LEN 32
+#define P256_PUB_LEN  65
 
 /* Named Argon2id profile constants. */
 #define ARGON2_LANES      4u
@@ -98,6 +105,120 @@ static int bio_write_hex(BIO *payload, const unsigned char *buf, size_t len) {
     return 1;
 }
 
+/* Construct an EVP_PKEY for P-256 from a raw 32-byte private scalar.
+ * Returns NULL on failure.
+ *
+ * OpenSSL 3.0 has no EVP_PKEY_CTX_set1_priv_bn; we must compute the
+ * public point manually, then assemble the key via EVP_PKEY_fromdata. */
+static EVP_PKEY *p256_key_from_private(const unsigned char *priv_scalar) {
+    EVP_PKEY *pkey = NULL;
+    EVP_PKEY_CTX *ctx = NULL;
+    BIGNUM *bn_priv = NULL;
+    EC_GROUP *group = NULL;
+    EC_POINT *pub_point = NULL;
+    unsigned char pub_buf[P256_PUB_LEN];
+    size_t pub_len = sizeof(pub_buf);
+    OSSL_PARAM_BLD *bld = NULL;
+    OSSL_PARAM *params = NULL;
+    int ok = 0;
+
+    /* 1. Convert raw scalar to BIGNUM. */
+    bn_priv = BN_bin2bn(priv_scalar, P256_PRIV_LEN, NULL);
+    if (!bn_priv) goto err;
+    BN_set_flags(bn_priv, BN_FLG_CONSTTIME);
+    
+    /* 2. Get P-256 group and compute public point = priv * G. */
+    group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
+    if (!group) goto err;
+
+    const BIGNUM *order = EC_GROUP_get0_order(group);
+    if (BN_is_zero(bn_priv) || BN_cmp(bn_priv, order) >= 0) {
+	/* either reject or reduce; rejecting is safer/more predictable */
+	goto err;
+    }
+    pub_point = EC_POINT_new(group);
+    if (!pub_point) goto err;
+
+    if (!EC_POINT_mul(group, pub_point, bn_priv, NULL, NULL, NULL)) goto err;
+
+    /* 3. Serialize public point (uncompressed). */
+    pub_len = EC_POINT_point2oct(group, pub_point,
+                                 POINT_CONVERSION_UNCOMPRESSED,
+                                 pub_buf, sizeof(pub_buf), NULL);
+    if (pub_len != P256_PUB_LEN) goto err;
+
+    /* 4. Build OSSL_PARAM array with group name, private scalar, public point. */
+    bld = OSSL_PARAM_BLD_new();
+    if (!bld) goto err;
+
+    if (!OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
+                                         "P-256", 0)) goto err;
+    if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, bn_priv)) goto err;
+    if (!OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY,
+                                          pub_buf, pub_len)) goto err;
+
+    params = OSSL_PARAM_BLD_to_param(bld);
+    if (!params) goto err;
+
+    /* 5. Create EVP_PKEY from the assembled parameters. */
+    ctx = EVP_PKEY_CTX_new_from_name(NULL, "EC", NULL);
+    if (!ctx) goto err;
+
+    if (EVP_PKEY_fromdata_init(ctx) <= 0) goto err;
+    if (EVP_PKEY_fromdata(ctx, &pkey, EVP_PKEY_KEYPAIR, params) <= 0) goto err;
+
+    ok = 1;
+
+err:
+    if (!ok) {
+        EVP_PKEY_free(pkey);
+        pkey = NULL;
+    }
+    OSSL_PARAM_free(params);
+    OSSL_PARAM_BLD_free(bld);
+    EC_POINT_free(pub_point);
+    EC_GROUP_free(group);
+    BN_clear_free(bn_priv);
+    EVP_PKEY_CTX_free(ctx);
+    return pkey;
+}
+
+/* Extract the raw private scalar and uncompressed public point from a
+ * P-256 EVP_PKEY. Returns 1 on success, 0 on failure. */
+static int p256_extract_keys(EVP_PKEY *pkey,
+                             unsigned char *priv_out, size_t *priv_len,
+                             unsigned char *pub_out, size_t *pub_len) {
+    BIGNUM *bn_priv = NULL;
+    int ok = 0;
+
+    /* Extract the private key BIGNUM. */
+    if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_PRIV_KEY, &bn_priv) <= 0) {
+        goto done;
+    }
+
+    if (BN_num_bytes(bn_priv) > (int)*priv_len) goto done;
+    *priv_len = (size_t)BN_num_bytes(bn_priv);
+    /* Left-pad with zeros to 32 bytes if necessary (BN_bn2bin omits leading zeros). */
+    memset(priv_out, 0, P256_PRIV_LEN);
+    if (BN_bn2bin(bn_priv, priv_out + (P256_PRIV_LEN - *priv_len)) != (int)*priv_len) {
+        goto done;
+    }
+    *priv_len = P256_PRIV_LEN;
+
+    /* Extract the encoded public key (uncompressed point). */
+    if (EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
+                                        pub_out, *pub_len, pub_len) <= 0) {
+        goto done;
+    }
+
+    ok = 1;
+
+done:
+    BN_free(bn_priv);
+    return ok;
+}
+
+
 int main(void) {
     char line[MAX_LINE_LEN];
     char algo[32] = {0};
@@ -105,11 +226,10 @@ int main(void) {
     unsigned char input_salt[SALT_LEN] = {0};
     unsigned char derived_key[SEED_LEN] = {0};
 
-    unsigned char priv_raw[32] = {0};
-    unsigned char pub_raw[32] = {0};
-    size_t priv_len = sizeof(priv_raw);
-    size_t pub_len  = sizeof(pub_raw);
-
+    unsigned char priv_raw[P256_PUB_LEN] = {0}; /* large enough for either */
+    unsigned char pub_raw[P256_PUB_LEN] = {0};
+    size_t priv_len = 0;
+    size_t pub_len  = 0;
 
 
     int has_algo = 0, has_seed = 0, has_salt = 0;
@@ -134,17 +254,21 @@ int main(void) {
          * anything other than an immediate '\n' or EOF, the line was too long.
          * The drain step itself settles the ambiguity; we deliberately do not
          * consult feof() here, since feof() is only set after a failed read. */
-        if (!strchr(line, '\n')) {
-            int c;
-            int overflowed = 0;
-            while ((c = getchar()) != EOF && c != '\n') overflowed = 1;
-            if (overflowed) {
+        size_t len = strlen(line);
+        if (len > 0 && line[len - 1] != '\n') {
+            int c = getchar();
+            if (c != EOF && c != '\n') {
+                /* The line is truly too long. Drain the rest of it. */
+                int drain;
+                while ((drain = getchar()) != EOF && drain != '\n');
+                
                 fail("Line too long");
-                goto cleanup;
+                continue; /* Skip this malformed line and keep processing input! */
             }
-            /* else: either the leftover was just '\n' (case 3) or we hit EOF
-             * (case 2); fall through and process the line. */
+            /* If c was '\n', we safely consumed the trailing newline. 
+             * If c was EOF, we safely hit the end of the stream. */
         }
+
         line[strcspn(line, "\r\n")] = '\0';
 
         if (line[0] == '\0') continue;  /* skip blank lines */
@@ -181,7 +305,7 @@ int main(void) {
         goto cleanup;
     }
 
-    if (strcmp(algo, "ED25519") != 0) {
+    if (strcmp(algo, "ED25519") != 0 && strcmp(algo, "P-256") != 0) {
         fail("Unsupported algorithm profile");
         goto cleanup;
     }
@@ -233,26 +357,50 @@ int main(void) {
     EVP_KDF_CTX_free(kdf_ctx);
     kdf_ctx = NULL;
 
-    pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
-                                        derived_key, sizeof(derived_key));
-    if (!pkey) {
-        fail("Asymmetric key synthesis failed");
-        goto cleanup;
-    }
+    /* Build the asymmetric key based on the algorithm. */
+    if (strcmp(algo, "ED25519") == 0) {
+        /* Original Ed25519 path: raw private key is supported directly. */
+        pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
+                                            derived_key, sizeof(derived_key));
+        if (!pkey) {
+            fail("Asymmetric key synthesis failed");
+            goto cleanup;
+        }
 
-    /* Stage the entire protocol output in one in-memory BIO. Nothing reaches
-     * stdout until every step has succeeded AND the full payload is ready.
-     * STATUS:SUCCESS is emitted last so a truncated stream can never end on a
-     * success marker. */
 
-    /* Extract the raw key material for hex output. */
-    if (EVP_PKEY_get_raw_private_key(pkey, priv_raw, &priv_len) <= 0) {
-        fail("Failed to extract raw private key");
-        goto cleanup;
-    }
-    if (EVP_PKEY_get_raw_public_key(pkey, pub_raw, &pub_len) <= 0) {
-        fail("Failed to extract raw public key");
-        goto cleanup;
+	/* Stage the entire protocol output in one in-memory BIO. Nothing reaches
+	 * stdout until every step has succeeded AND the full payload is ready.
+	 * STATUS:SUCCESS is emitted last so a truncated stream can never end on a
+	 * success marker. */
+
+	priv_len = sizeof(priv_raw);
+        pub_len  = sizeof(pub_raw);
+
+
+	/* Extract the raw key material for hex output. */
+	if (EVP_PKEY_get_raw_private_key(pkey, priv_raw, &priv_len) <= 0) {
+            fail("Failed to extract raw private key");
+            goto cleanup;
+        }
+        if (EVP_PKEY_get_raw_public_key(pkey, pub_raw, &pub_len) <= 0) {
+            fail("Failed to extract raw public key");
+            goto cleanup;
+        }
+    } else {
+        /* P-256 path: construct key via provider API, extract via BN + param API. */
+        pkey = p256_key_from_private(derived_key);
+        if (!pkey) {
+            fail("P-256 key synthesis failed");
+            goto cleanup;
+        }
+
+        priv_len = sizeof(priv_raw);
+        pub_len  = sizeof(pub_raw);
+
+        if (!p256_extract_keys(pkey, priv_raw, &priv_len, pub_raw, &pub_len)) {
+            fail("Failed to extract P-256 key material");
+            goto cleanup;
+        }
     }
     
     payload = BIO_new(BIO_s_mem());
@@ -292,7 +440,11 @@ int main(void) {
 cleanup:
     if (pkey)    EVP_PKEY_free(pkey);
     if (kdf_ctx) EVP_KDF_CTX_free(kdf_ctx);
-    if (payload) BIO_free(payload);
+    if (payload) {
+	char *p; long l = BIO_get_mem_data(payload, &p);
+	if (p && l > 0) OPENSSL_cleanse(p, (size_t)l);
+	BIO_free(payload);
+    }
 
     OPENSSL_cleanse(input_seed, sizeof(input_seed));
     OPENSSL_cleanse(input_salt, sizeof(input_salt));
