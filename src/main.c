@@ -106,10 +106,7 @@ static int bio_write_hex(BIO *payload, const unsigned char *buf, size_t len) {
 }
 
 /* Construct an EVP_PKEY for P-256 from a raw 32-byte private scalar.
- * Returns NULL on failure.
- *
- * OpenSSL 3.0 has no EVP_PKEY_CTX_set1_priv_bn; we must compute the
- * public point manually, then assemble the key via EVP_PKEY_fromdata. */
+ * Returns NULL on failure. */
 static EVP_PKEY *p256_key_from_private(const unsigned char *priv_scalar) {
     EVP_PKEY *pkey = NULL;
     EVP_PKEY_CTX *ctx = NULL;
@@ -125,16 +122,16 @@ static EVP_PKEY *p256_key_from_private(const unsigned char *priv_scalar) {
     /* 1. Convert raw scalar to BIGNUM. */
     bn_priv = BN_bin2bn(priv_scalar, P256_PRIV_LEN, NULL);
     if (!bn_priv) goto err;
+
     BN_set_flags(bn_priv, BN_FLG_CONSTTIME);
-    
+
     /* 2. Get P-256 group and compute public point = priv * G. */
     group = EC_GROUP_new_by_curve_name(NID_X9_62_prime256v1);
     if (!group) goto err;
 
     const BIGNUM *order = EC_GROUP_get0_order(group);
     if (BN_is_zero(bn_priv) || BN_cmp(bn_priv, order) >= 0) {
-	/* either reject or reduce; rejecting is safer/more predictable */
-	goto err;
+        goto err;
     }
     pub_point = EC_POINT_new(group);
     if (!pub_point) goto err;
@@ -151,11 +148,9 @@ static EVP_PKEY *p256_key_from_private(const unsigned char *priv_scalar) {
     bld = OSSL_PARAM_BLD_new();
     if (!bld) goto err;
 
-    if (!OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME,
-                                         "P-256", 0)) goto err;
+    if (!OSSL_PARAM_BLD_push_utf8_string(bld, OSSL_PKEY_PARAM_GROUP_NAME, "P-256", 0)) goto err;
     if (!OSSL_PARAM_BLD_push_BN(bld, OSSL_PKEY_PARAM_PRIV_KEY, bn_priv)) goto err;
-    if (!OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY,
-                                          pub_buf, pub_len)) goto err;
+    if (!OSSL_PARAM_BLD_push_octet_string(bld, OSSL_PKEY_PARAM_PUB_KEY, pub_buf, pub_len)) goto err;
 
     params = OSSL_PARAM_BLD_to_param(bld);
     if (!params) goto err;
@@ -176,12 +171,14 @@ err:
     }
     OSSL_PARAM_free(params);
     OSSL_PARAM_BLD_free(bld);
-    EC_POINT_free(pub_point);
-    EC_GROUP_free(group);
-    BN_clear_free(bn_priv);
+    EC_POINT_free(pub_point); // Safe to call with NULL
+    EC_GROUP_free(group);     // Safe to call with NULL
+    if (bn_priv) BN_clear_free(bn_priv);
     EVP_PKEY_CTX_free(ctx);
     return pkey;
 }
+
+
 
 /* Extract the raw private scalar and uncompressed public point from a
  * P-256 EVP_PKEY. Returns 1 on success, 0 on failure. */
@@ -191,13 +188,14 @@ static int p256_extract_keys(EVP_PKEY *pkey,
     BIGNUM *bn_priv = NULL;
     int ok = 0;
 
-    /* Extract the private key BIGNUM. */
+    /* 1. Extract the private key BIGNUM. */
     if (EVP_PKEY_get_bn_param(pkey, OSSL_PKEY_PARAM_PRIV_KEY, &bn_priv) <= 0) {
         goto done;
     }
 
     if (BN_num_bytes(bn_priv) > (int)*priv_len) goto done;
     *priv_len = (size_t)BN_num_bytes(bn_priv);
+    
     /* Left-pad with zeros to 32 bytes if necessary (BN_bn2bin omits leading zeros). */
     memset(priv_out, 0, P256_PRIV_LEN);
     if (BN_bn2bin(bn_priv, priv_out + (P256_PRIV_LEN - *priv_len)) != (int)*priv_len) {
@@ -205,16 +203,19 @@ static int p256_extract_keys(EVP_PKEY *pkey,
     }
     *priv_len = P256_PRIV_LEN;
 
-    /* Extract the encoded public key (uncompressed point). */
+    /* 2. Extract the encoded public key (uncompressed point). */
     if (EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
                                         pub_out, *pub_len, pub_len) <= 0) {
+        /* SECURITY FIX: If public key extraction fails after the private key 
+         * was written, instantly scrub priv_out to prevent secret leakage. */
+        OPENSSL_cleanse(priv_out, P256_PRIV_LEN);
         goto done;
     }
 
     ok = 1;
 
 done:
-    BN_free(bn_priv);
+    if (bn_priv) BN_clear_free(bn_priv);
     return ok;
 }
 
