@@ -2,12 +2,12 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdlib.h>
+#include <stddef.h>
 #include <openssl/evp.h>
 #include <openssl/kdf.h>
 #include <openssl/core_names.h>
 #include <openssl/params.h>
 #include <openssl/crypto.h>
-#include <openssl/pem.h>
 #include <openssl/bio.h>
 
 #define MAX_LINE_LEN 512
@@ -84,8 +84,18 @@ static int commit_payload(BIO *payload) {
 /* Write a fixed string into the payload BIO and fail hard if the write did
  * not fully succeed. Returns 1 on success, 0 on failure. */
 static int bio_write_str(BIO *payload, const char *s) {
-    int n = BIO_printf(payload, "%s", s);
-    return n >= 0;
+    size_t len = strlen(s);
+    return BIO_write(payload, s, (int)len) == (int)len;
+}
+
+/* Append the lowercase hex encoding of `len` bytes from `buf` to `payload`. */
+static int bio_write_hex(BIO *payload, const unsigned char *buf, size_t len) {
+    static const char digits[] = "0123456789abcdef";
+    for (size_t i = 0; i < len; i++) {
+        if (BIO_write(payload, &digits[buf[i] >> 4], 1) != 1) return 0;
+        if (BIO_write(payload, &digits[buf[i] & 0x0f], 1) != 1) return 0;
+    }
+    return 1;
 }
 
 int main(void) {
@@ -94,6 +104,13 @@ int main(void) {
     unsigned char input_seed[SEED_LEN] = {0};
     unsigned char input_salt[SALT_LEN] = {0};
     unsigned char derived_key[SEED_LEN] = {0};
+
+    unsigned char priv_raw[32] = {0};
+    unsigned char pub_raw[32] = {0};
+    size_t priv_len = sizeof(priv_raw);
+    size_t pub_len  = sizeof(pub_raw);
+
+
 
     int has_algo = 0, has_seed = 0, has_salt = 0;
     int ok = 0;
@@ -198,7 +215,6 @@ int main(void) {
         uint32_t lanes      = ARGON2_LANES;
         uint32_t mem_kb     = ARGON2_MEM_KB;
         uint32_t iterations = ARGON2_ITERATIONS;
-	
 
 	OSSL_PARAM params[] = {
             OSSL_PARAM_construct_octet_string(OSSL_KDF_PARAM_PASSWORD, input_seed, SEED_LEN),
@@ -208,7 +224,6 @@ int main(void) {
             OSSL_PARAM_construct_uint32(OSSL_KDF_PARAM_ITER, &iterations),
             OSSL_PARAM_construct_end()
         };
-
 
         if (EVP_KDF_derive(kdf_ctx, derived_key, sizeof(derived_key), params) <= 0) {
             fail("Key derivation failed");
@@ -229,6 +244,17 @@ int main(void) {
      * stdout until every step has succeeded AND the full payload is ready.
      * STATUS:SUCCESS is emitted last so a truncated stream can never end on a
      * success marker. */
+
+    /* Extract the raw key material for hex output. */
+    if (EVP_PKEY_get_raw_private_key(pkey, priv_raw, &priv_len) <= 0) {
+        fail("Failed to extract raw private key");
+        goto cleanup;
+    }
+    if (EVP_PKEY_get_raw_public_key(pkey, pub_raw, &pub_len) <= 0) {
+        fail("Failed to extract raw public key");
+        goto cleanup;
+    }
+    
     payload = BIO_new(BIO_s_mem());
     if (!payload) {
         fail("Failed to allocate output buffer");
@@ -239,19 +265,19 @@ int main(void) {
         fail("Failed to stage private key header");
         goto cleanup;
     }
-    if (!PEM_write_bio_PKCS8PrivateKey(payload, pkey, NULL, NULL, 0, NULL, NULL)) {
+    if (!bio_write_hex(payload, priv_raw, priv_len)) {
         fail("Failed to write private key");
         goto cleanup;
     }
-    if (!bio_write_str(payload, "PUBLIC_KEY:\n")) {
+    if (!bio_write_str(payload, "\nPUBLIC_KEY:\n")) {
         fail("Failed to stage public key header");
         goto cleanup;
     }
-    if (!PEM_write_bio_PUBKEY(payload, pkey)) {
+    if (!bio_write_hex(payload, pub_raw, pub_len)) {
         fail("Failed to write public key");
         goto cleanup;
     }
-    if (!bio_write_str(payload, "STATUS:SUCCESS\n")) {
+    if (!bio_write_str(payload, "\nSTATUS:SUCCESS\n")) {
         fail("Failed to stage status footer");
         goto cleanup;
     }
@@ -273,5 +299,8 @@ cleanup:
     OPENSSL_cleanse(derived_key, sizeof(derived_key));
     OPENSSL_cleanse(line, sizeof(line));
 
+    OPENSSL_cleanse(priv_raw, sizeof(priv_raw));
+    OPENSSL_cleanse(pub_raw, sizeof(pub_raw));
+    
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
