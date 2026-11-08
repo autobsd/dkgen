@@ -31,6 +31,10 @@ _Static_assert(SEED_LEN == 32, "Ed25519 raw private key must be 32 bytes");
 #define ARGON2_MEM_KB     65536u   /* 64 MiB */
 #define ARGON2_ITERATIONS 3u
 
+/* Output lengths for the raw Argon2id profiles. */
+#define ARGON2ID_20_LEN 20
+#define ARGON2ID_32_LEN 32
+
 /* Return 0-15 for a hex digit, -1 otherwise. */
 static int hexval(char c) {
     if (c >= '0' && c <= '9') return c - '0';
@@ -178,8 +182,6 @@ err:
     return pkey;
 }
 
-
-
 /* Extract the raw private scalar and uncompressed public point from a
  * P-256 EVP_PKEY. Returns 1 on success, 0 on failure. */
 static int p256_extract_keys(EVP_PKEY *pkey,
@@ -193,12 +195,16 @@ static int p256_extract_keys(EVP_PKEY *pkey,
         goto done;
     }
 
-    if (BN_num_bytes(bn_priv) > (int)*priv_len) goto done;
-    *priv_len = (size_t)BN_num_bytes(bn_priv);
+    int bn_bytes = BN_num_bytes(bn_priv);
+    /* Defensive check: Ensure the private scalar fits perfectly within 
+     * a 32-byte P-256 allocation without causing negative pointer offsets. */
+    if (bn_bytes <= 0 || bn_bytes > P256_PRIV_LEN) {
+        goto done;
+    }
     
-    /* Left-pad with zeros to 32 bytes if necessary (BN_bn2bin omits leading zeros). */
+    /* Left-pad with zeros to exactly 32 bytes (BN_bn2bin omits leading zeros). */
     memset(priv_out, 0, P256_PRIV_LEN);
-    if (BN_bn2bin(bn_priv, priv_out + (P256_PRIV_LEN - *priv_len)) != (int)*priv_len) {
+    if (BN_bn2bin(bn_priv, priv_out + (P256_PRIV_LEN - (size_t)bn_bytes)) != bn_bytes) {
         goto done;
     }
     *priv_len = P256_PRIV_LEN;
@@ -206,26 +212,31 @@ static int p256_extract_keys(EVP_PKEY *pkey,
     /* 2. Extract the encoded public key (uncompressed point). */
     if (EVP_PKEY_get_octet_string_param(pkey, OSSL_PKEY_PARAM_ENCODED_PUBLIC_KEY,
                                         pub_out, *pub_len, pub_len) <= 0) {
-        /* SECURITY FIX: If public key extraction fails after the private key 
-         * was written, instantly scrub priv_out to prevent secret leakage. */
-        OPENSSL_cleanse(priv_out, P256_PRIV_LEN);
         goto done;
+    }
+
+    if (*pub_len != P256_PUB_LEN) {
+	goto done;
     }
 
     ok = 1;
 
 done:
+    if (!ok) OPENSSL_cleanse(priv_out, P256_PRIV_LEN);
+
     if (bn_priv) BN_clear_free(bn_priv);
     return ok;
 }
-
 
 int main(void) {
     char line[MAX_LINE_LEN];
     char algo[32] = {0};
     unsigned char input_seed[SEED_LEN] = {0};
     unsigned char input_salt[SALT_LEN] = {0};
+    /* Large enough to hold the longest Argon2id output we support (32 bytes),
+     * which also matches the Ed25519 seed and P-256 scalar sizes. */
     unsigned char derived_key[SEED_LEN] = {0};
+    size_t derived_key_len = 0;
 
     unsigned char priv_raw[P256_PUB_LEN] = {0}; /* large enough for either */
     unsigned char pub_raw[P256_PUB_LEN] = {0};
@@ -277,7 +288,8 @@ int main(void) {
         if (strncmp(line, "ALGO:", 5) == 0) {
             if (has_algo) { fail("Duplicate ALGO field"); goto cleanup; }
             if (strlen(line + 5) >= sizeof(algo)) {
-                fail("ALGO value too long"); goto cleanup;
+                fail("ALGO value too long");
+		goto cleanup;
             }
             snprintf(algo, sizeof(algo), "%s", line + 5);
             has_algo = 1;
@@ -306,7 +318,10 @@ int main(void) {
         goto cleanup;
     }
 
-    if (strcmp(algo, "ED25519") != 0 && strcmp(algo, "P-256") != 0) {
+    if (strcmp(algo, "ED25519") != 0 &&
+        strcmp(algo, "P-256") != 0 &&
+        strcmp(algo, "ARGON2ID_20") != 0 &&
+        strcmp(algo, "ARGON2ID_32") != 0) {
         fail("Unsupported algorithm profile");
         goto cleanup;
     }
@@ -320,6 +335,14 @@ int main(void) {
     if (!not_all_zero(input_salt, SALT_LEN)) {
         fail("SALT is all zeros");
         goto cleanup;
+    }
+
+    /* Determine how many bytes of Argon2id output this profile needs. */
+    if (strcmp(algo, "ARGON2ID_20") == 0) {
+        derived_key_len = ARGON2ID_20_LEN;
+    } else {
+        /* ED25519, P-256 and ARGON2ID_32 all use a 32-byte derived key. */
+        derived_key_len = ARGON2ID_32_LEN;
     }
 
     {
@@ -350,7 +373,7 @@ int main(void) {
             OSSL_PARAM_construct_end()
         };
 
-        if (EVP_KDF_derive(kdf_ctx, derived_key, sizeof(derived_key), params) <= 0) {
+        if (EVP_KDF_derive(kdf_ctx, derived_key, derived_key_len, params) <= 0) {
             fail("Key derivation failed");
             goto cleanup;
         }
@@ -358,11 +381,42 @@ int main(void) {
     EVP_KDF_CTX_free(kdf_ctx);
     kdf_ctx = NULL;
 
+    /* Raw Argon2id profiles output the derived key directly, with no
+     * asymmetric key material. */
+    if (strcmp(algo, "ARGON2ID_20") == 0 || strcmp(algo, "ARGON2ID_32") == 0) {
+        payload = BIO_new(BIO_s_mem());
+        if (!payload) {
+            fail("Failed to allocate output buffer");
+            goto cleanup;
+        }
+
+        if (!bio_write_str(payload, "KEY:\n")) {
+            fail("Failed to stage derived key header");
+            goto cleanup;
+        }
+        if (!bio_write_hex(payload, derived_key, derived_key_len)) {
+            fail("Failed to write derived key");
+            goto cleanup;
+        }
+        if (!bio_write_str(payload, "\nSTATUS:SUCCESS\n")) {
+            fail("Failed to stage status footer");
+            goto cleanup;
+        }
+
+        if (!commit_payload(payload)) {
+            fail("stdout error");
+            goto cleanup;
+        }
+
+        ok = 1;
+        goto cleanup;
+    }
+
     /* Build the asymmetric key based on the algorithm. */
     if (strcmp(algo, "ED25519") == 0) {
         /* Original Ed25519 path: raw private key is supported directly. */
         pkey = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL,
-                                            derived_key, sizeof(derived_key));
+                                            derived_key, derived_key_len);
         if (!pkey) {
             fail("Asymmetric key synthesis failed");
             goto cleanup;

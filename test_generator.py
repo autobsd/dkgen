@@ -215,6 +215,90 @@ class TestKeyGenerator(unittest.TestCase):
         self.assertTrue(stdout.endswith(expected_status), "Output sequence must finish with SUCCESS status")
         self.assertEqual(stderr, "", "Stderr should remain clear for successful operations")
 
+    def test_happy_path_argon2id_20(self):
+        """Validates that the ARGON2ID_20 profile successfully derives a 20-byte key."""
+        valid_input = (
+            "ALGO:ARGON2ID_20\n"
+            "SEED:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\n"
+            "SALT:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n"
+        )
+        code, stdout, stderr = self.run_binary(valid_input)
+        
+        self.assertEqual(code, 0, "ARGON2ID_20 profile should exit with 0")
+        self.assertIn("KEY:\n", stdout)
+        self.assertNotIn("PRIVATE_KEY:", stdout)
+        self.assertNotIn("PUBLIC_KEY:", stdout)
+        
+        # Extract the key line to verify its length (20 bytes = 40 hex characters)
+        lines = stdout.strip().split('\n')
+        self.assertIn("KEY:", lines)
+        key_index = lines.index("KEY:") + 1
+        derived_key = lines[key_index]
+        self.assertEqual(len(derived_key), 40, "ARGON2ID_20 output must be exactly 40 hex characters")
+        self.assertTrue(stdout.endswith("STATUS:SUCCESS\n"))
+        self.assertEqual(stderr, "")
+
+    def test_happy_path_argon2id_32(self):
+        """Validates that the ARGON2ID_32 profile successfully derives a 32-byte key."""
+        valid_input = (
+            "ALGO:ARGON2ID_32\n"
+            "SEED:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\n"
+            "SALT:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n"
+        )
+        code, stdout, stderr = self.run_binary(valid_input)
+        
+        self.assertEqual(code, 0, "ARGON2ID_32 profile should exit with 0")
+        self.assertIn("KEY:\n", stdout)
+        
+        # Extract the key line to verify its length (32 bytes = 64 hex characters)
+        lines = stdout.strip().split('\n')
+        self.assertIn("KEY:", lines)
+        key_index = lines.index("KEY:") + 1
+        derived_key = lines[key_index]
+        self.assertEqual(len(derived_key), 64, "ARGON2ID_32 output must be exactly 64 hex characters")
+        self.assertTrue(stdout.endswith("STATUS:SUCCESS\n"))
+        self.assertEqual(stderr, "")
+
+    def test_argon2id_20_exact_cryptographic_output(self):
+        """Validates the exact expected raw cryptographic output for ARGON2ID_20."""
+        valid_input = (
+            "ALGO:ARGON2ID_20\n"
+            "SEED:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\n"
+            "SALT:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n"
+        )
+        
+        # Expected exact output sequence based on Argon2id with 4 lanes, 64MiB, 3 iterations
+        expected_output = (
+            "KEY:\n"
+            "1f690bc4a65517be2eef6ec7510a4b858fd749ef\n"
+            "STATUS:SUCCESS\n"
+        )
+        
+        code, stdout, stderr = self.run_binary(valid_input)
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, expected_output, "Cryptographic output for ARGON2ID_20 mismatched")
+        self.assertEqual(stderr, "")
+
+    def test_argon2id_32_exact_cryptographic_output(self):
+        """Validates the exact expected raw cryptographic output for ARGON2ID_32."""
+        valid_input = (
+            "ALGO:ARGON2ID_32\n"
+            "SEED:0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20\n"
+            "SALT:a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4e5f6a1b2\n"
+        )
+        
+        # Note: The first 32 bytes of the Argon2id output match the raw private keys 
+        # generated in your existing ED25519 and P-256 test cases.
+        expected_output = (
+            "KEY:\n"
+            "5b9bdcfb6a9457569fda58715c711c3c9fb38ed89769af6538cc879dbbf46032\n"
+            "STATUS:SUCCESS\n"
+        )
+        
+        code, stdout, stderr = self.run_binary(valid_input)
+        self.assertEqual(code, 0)
+        self.assertEqual(stdout, expected_output, "Cryptographic output for ARGON2ID_32 mismatched")
+        self.assertEqual(stderr, "")
 
 if __name__ == "__main__":
     unittest.main()
