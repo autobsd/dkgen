@@ -31,7 +31,7 @@ TEST_SCRIPT := test_generator.py
 
 .PHONY: all clean distclean run test test-asan
 
-all: $(TARGET)
+build: $(TARGET)
 
 $(TARGET): $(SRC) | $(BIN_DIR)
 	$(CC) $(CPPFLAGS) $(CFLAGS) -o $@ $(SRC) $(LDFLAGS) $(LDLIBS)
