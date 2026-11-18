@@ -5,24 +5,8 @@
 #include <openssl/crypto.h>
 #include "dkgen.h"
 
-#define MAX_LINE_LEN 512
-
-static int hexval(char c) {
-    if (c >= '0' && c <= '9') return c - '0';
-    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
-    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
-    return -1;
-}
-
-static int hex_to_bytes_exact(const char *hex, unsigned char *buf, size_t want) {
-    if (strlen(hex) != want * 2) return 0;
-    for (size_t i = 0; i < want * 2; i += 2) {
-        int hi = hexval(hex[i]), lo = hexval(hex[i + 1]);
-        if (hi < 0 || lo < 0) return 0;
-        buf[i / 2] = (unsigned char)((hi << 4) | lo);
-    }
-    return 1;
-}
+#define MAX_LINE_LEN 4096
+#define MAX_OUT_LEN  128   /* generous cap for any profile output */
 
 static void fail(const char *msg) {
     fprintf(stderr, "STATUS:FAILURE\nERROR:%s\n", msg);
@@ -52,8 +36,11 @@ static int commit_payload(BIO *payload) {
 
 int main(void) {
     char line[MAX_LINE_LEN], algo_str[32] = {0};
-    unsigned char seed[DKGEN_SEED_LEN] = {0}, salt[DKGEN_SALT_LEN] = {0};
-    int has_algo = 0, has_seed = 0, has_salt = 0, ok = 0;
+    /* Text values are copied into cleansed buffers so we can wipe them. */
+    char passphrase[MAX_LINE_LEN] = {0};
+    char salt[MAX_LINE_LEN]       = {0};
+    char pepper[MAX_LINE_LEN]     = {0};
+    int has_algo = 0, has_pass = 0, has_salt = 0, has_pepper = 0, ok = 0;
     BIO *payload = NULL;
 
     while (fgets(line, sizeof(line), stdin)) {
@@ -75,35 +62,61 @@ int main(void) {
             if (strlen(line + 5) >= sizeof(algo_str)) { fail("ALGO value too long"); goto cleanup; }
             snprintf(algo_str, sizeof(algo_str), "%s", line + 5);
             has_algo = 1;
-        } else if (strncmp(line, "SEED:", 5) == 0) {
-            if (has_seed) { fail("Duplicate SEED field"); goto cleanup; }
-            if (!hex_to_bytes_exact(line + 5, seed, DKGEN_SEED_LEN)) { fail("Invalid SEED"); goto cleanup; }
-            has_seed = 1;
+        } else if (strncmp(line, "PASSPHRASE:", 11) == 0) {
+            if (has_pass) { fail("Duplicate PASSPHRASE field"); goto cleanup; }
+            /* Everything after the colon is significant, including spaces. */
+            snprintf(passphrase, sizeof(passphrase), "%s", line + 11);
+            has_pass = 1;
         } else if (strncmp(line, "SALT:", 5) == 0) {
             if (has_salt) { fail("Duplicate SALT field"); goto cleanup; }
-            if (!hex_to_bytes_exact(line + 5, salt, DKGEN_SALT_LEN)) { fail("Invalid SALT"); goto cleanup; }
+            snprintf(salt, sizeof(salt), "%s", line + 5);
             has_salt = 1;
+        } else if (strncmp(line, "PEPPER:", 7) == 0) {
+            if (has_pepper) { fail("Duplicate PEPPER field"); goto cleanup; }
+            snprintf(pepper, sizeof(pepper), "%s", line + 7);
+            has_pepper = 1;
         } else {
             fail("Unknown line in input");
             goto cleanup;
         }
     }
 
-    if (!has_algo || !has_seed || !has_salt) { fail("Missing required fields"); goto cleanup; }
+    if (!has_algo || !has_pass || !has_salt) { fail("Missing required fields"); goto cleanup; }
 
-    dkgen_algo_t algo;
+    dkgen_algo algo;
     if (strcmp(algo_str, "ED25519") == 0) algo = DKGEN_ALGO_ED25519;
     else if (strcmp(algo_str, "P-256") == 0) algo = DKGEN_ALGO_P256;
     else if (strcmp(algo_str, "ARGON2ID_20") == 0) algo = DKGEN_ALGO_ARGON2ID_20;
     else if (strcmp(algo_str, "ARGON2ID_32") == 0) algo = DKGEN_ALGO_ARGON2ID_32;
     else { fail("Unsupported algorithm profile"); goto cleanup; }
 
-    dkgen_sym_out_t sym_out = {0};
-    dkgen_asym_out_t asym_out = {0};
-    dkgen_result_t res = dkgen_derive(algo, seed, salt, &sym_out, &asym_out);
+    /* Caller-provided output buffers with in/out capacities. */
+    uint8_t priv_out[MAX_OUT_LEN] = {0};
+    uint8_t pub_out[MAX_OUT_LEN]  = {0};
+    size_t  priv_len = sizeof(priv_out);
+    size_t  pub_len  = sizeof(pub_out);
 
-    if (res != DKGEN_SUCCESS) {
-        fail(dkgen_strerror(res));
+    /* Passphrase and salt are text; pepper is optional. */
+    dkgen_result res = dkgen_derive(
+        algo,
+        (const uint8_t *)passphrase, strlen(passphrase),
+        (const uint8_t *)salt,       strlen(salt),
+        has_pepper ? (const uint8_t *)pepper : NULL,
+        has_pepper ? strlen(pepper) : 0,
+        priv_out, &priv_len,
+        pub_out,  &pub_len);
+
+    if (res != DKGEN_OK) {
+        const char *msg;
+        switch (res) {
+            case DKGEN_ERR_INVALID_ARG:      msg = "Invalid argument";        break;
+            case DKGEN_ERR_UNKNOWN_ALGO:     msg = "Unknown algorithm";       break;
+            case DKGEN_ERR_BUFFER_TOO_SMALL: msg = "Output buffer too small"; break;
+            case DKGEN_ERR_DERIVE:           msg = "Derivation failed";       break;
+            case DKGEN_ERR_INTERNAL:         msg = "Internal error";          break;
+            default:                         msg = "Unknown error";           break;
+        }
+        fail(msg);
         goto cleanup;
     }
 
@@ -111,13 +124,15 @@ int main(void) {
     if (!payload) { fail("Failed to allocate output buffer"); goto cleanup; }
 
     if (algo == DKGEN_ALGO_ARGON2ID_20 || algo == DKGEN_ALGO_ARGON2ID_32) {
-        if (!bio_write_str(payload, "KEY:\n") || 
-            !bio_write_hex(payload, sym_out.key, sym_out.len)) goto cleanup;
-    } else {
+        /* Argon2id: emit the derived key material as KEY. */
         if (!bio_write_str(payload, "PRIVATE_KEY:\n") ||
-            !bio_write_hex(payload, asym_out.private_key, asym_out.private_len) ||
+            !bio_write_hex(payload, priv_out, priv_len)) goto cleanup;
+    } else {
+        /* Asymmetric: emit private and public key material. */
+        if (!bio_write_str(payload, "PRIVATE_KEY:\n") ||
+            !bio_write_hex(payload, priv_out, priv_len) ||
             !bio_write_str(payload, "\nPUBLIC_KEY:\n") ||
-            !bio_write_hex(payload, asym_out.public_key, asym_out.public_len)) goto cleanup;
+            !bio_write_hex(payload, pub_out, pub_len)) goto cleanup;
     }
 
     if (!bio_write_str(payload, "\nSTATUS:SUCCESS\n") || !commit_payload(payload)) goto cleanup;
@@ -129,10 +144,10 @@ cleanup:
         if (p && l > 0) OPENSSL_cleanse(p, (size_t)l);
         BIO_free(payload);
     }
-    OPENSSL_cleanse(seed, sizeof(seed));
+    OPENSSL_cleanse(passphrase, sizeof(passphrase));
     OPENSSL_cleanse(salt, sizeof(salt));
-    OPENSSL_cleanse(&sym_out, sizeof(sym_out));
-    OPENSSL_cleanse(&asym_out, sizeof(asym_out));
+    OPENSSL_cleanse(pepper, sizeof(pepper));
+    OPENSSL_cleanse(priv_out, sizeof(priv_out));
+    OPENSSL_cleanse(pub_out, sizeof(pub_out));
     return ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
-
