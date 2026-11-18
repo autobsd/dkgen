@@ -33,6 +33,18 @@ typedef enum dkgen_result {
     DKGEN_ERR_INTERNAL       = 5   /* Internal/unexpected error             */
 } dkgen_result;
 
+const char *dkgen_strerror(dkgen_result res);
+
+    
+#define DKGEN_ED25519_PRIV_LEN     32
+#define DKGEN_ED25519_PUB_LEN      32
+#define DKGEN_P256_PRIV_LEN        32
+#define DKGEN_P256_PUB_LEN         65
+#define DKGEN_ARGON2ID_20_LEN      20
+#define DKGEN_ARGON2ID_32_LEN      32
+#define DKGEN_MAX_PRIV_LEN         32
+#define DKGEN_MAX_PUB_LEN          65
+
 /*
  * dkgen_derive
  *

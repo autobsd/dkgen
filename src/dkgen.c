@@ -13,15 +13,22 @@
 #define ARGON2_MEM_KB     65536u
 #define ARGON2_ITERATIONS 3u
 
-#define DKGEN_P256_PRIV_LEN 32
-#define DKGEN_P256_PUB_LEN  65
-#define DKGEN_ED25519_PRIV_LEN 32
-#define DKGEN_ED25519_PUB_LEN  32
-
 /* Largest derived-key size any selector currently produces.  Sized
  * defensively so a future 64-byte selector (e.g. Ed448) does not
  * silently overflow the stack buffer.  See static_assert below. */
 #define DKGEN_MAX_DERIVED_KEY_LEN 64
+
+const char *dkgen_strerror(dkgen_result res) {
+    switch (res) {
+        case DKGEN_OK:                   return "Success";
+        case DKGEN_ERR_INVALID_ARG:      return "Invalid argument";
+        case DKGEN_ERR_UNKNOWN_ALGO:     return "Unknown algorithm";
+        case DKGEN_ERR_BUFFER_TOO_SMALL: return "Output buffer too small";
+        case DKGEN_ERR_DERIVE:           return "Derivation failed";
+        case DKGEN_ERR_INTERNAL:         return "Internal error";
+        default:                         return "Unknown error";
+    }
+}
 
 static EVP_PKEY *p256_key_from_private(const unsigned char *priv_scalar, size_t priv_scalar_len) {
     EVP_PKEY *pkey = NULL;
@@ -157,26 +164,26 @@ dkgen_result dkgen_derive(
     size_t req_pub_len = 0;
 
     switch (algo) {
-        case DKGEN_ALGO_ARGON2ID_20:
-            derived_key_len = 20;
-            req_priv_len = 20;
-            break;
-        case DKGEN_ALGO_ARGON2ID_32:
-            derived_key_len = 32;
-            req_priv_len = 32;
-            break;
-        case DKGEN_ALGO_ED25519:
-            derived_key_len = 32;
-            req_priv_len = DKGEN_ED25519_PRIV_LEN;
-            req_pub_len  = DKGEN_ED25519_PUB_LEN;
-            break;
-        case DKGEN_ALGO_P256:
-            derived_key_len = 32;
-            req_priv_len = DKGEN_P256_PRIV_LEN;
-            req_pub_len  = DKGEN_P256_PUB_LEN;
-            break;
-        default:
-            return DKGEN_ERR_UNKNOWN_ALGO;
+    case DKGEN_ALGO_ARGON2ID_20:
+	derived_key_len = DKGEN_ARGON2ID_20_LEN;
+	req_priv_len = DKGEN_ARGON2ID_20_LEN;
+	break;
+    case DKGEN_ALGO_ARGON2ID_32:
+	derived_key_len = DKGEN_ARGON2ID_32_LEN;
+	req_priv_len = DKGEN_ARGON2ID_32_LEN;
+	break;
+    case DKGEN_ALGO_ED25519:
+	derived_key_len = DKGEN_ED25519_PRIV_LEN;
+	req_priv_len = DKGEN_ED25519_PRIV_LEN;
+	req_pub_len  = DKGEN_ED25519_PUB_LEN;
+	break;
+    case DKGEN_ALGO_P256:
+	derived_key_len = DKGEN_P256_PRIV_LEN;
+	req_priv_len = DKGEN_P256_PRIV_LEN;
+	req_pub_len  = DKGEN_P256_PUB_LEN;
+	break;
+    default:
+	return DKGEN_ERR_UNKNOWN_ALGO;
     }
 
     /* Fail fast with DKGEN_ERR_BUFFER_TOO_SMALL across ALL algorithms */
@@ -247,7 +254,7 @@ dkgen_result dkgen_derive(
         size_t plen = *priv_len, qlen = *pub_len;
         int priv_ok = (EVP_PKEY_get_raw_private_key(pkey, priv_out, &plen) > 0);
         int pub_ok  = priv_ok &&
-                      (EVP_PKEY_get_raw_public_key(pkey, pub_out, &qlen) > 0);
+	    (EVP_PKEY_get_raw_public_key(pkey, pub_out, &qlen) > 0);
         if (!priv_ok || !pub_ok) {
             /* Fix 1: cleanse any partial private-key material before
              * returning; leave the caller's lengths untouched. */
@@ -259,15 +266,13 @@ dkgen_result dkgen_derive(
         *priv_len = plen;
         *pub_len  = qlen;
     } else { /* DKGEN_ALGO_P256 */
-        pkey = p256_key_from_private(derived_key, derived_key_len);
-        if (!pkey) { res = DKGEN_ERR_DERIVE; goto cleanup; }
-
-        if (!p256_extract_keys(pkey, priv_out, priv_len, pub_out, pub_len)) {
-            res = DKGEN_ERR_INTERNAL;
-            goto cleanup;
-        }
+	pkey = p256_key_from_private(derived_key, derived_key_len);
+	if (!pkey) { res = DKGEN_ERR_DERIVE; goto cleanup; }
+	if (!p256_extract_keys(pkey, priv_out, priv_len, pub_out, pub_len)) {
+	    res = DKGEN_ERR_INTERNAL;
+	    goto cleanup;
+	}
     }
-
 cleanup:
     if (pkey) EVP_PKEY_free(pkey);
     EVP_KDF_CTX_free(kdf_ctx);

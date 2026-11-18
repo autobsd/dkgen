@@ -6,7 +6,6 @@
 #include "dkgen.h"
 
 #define MAX_LINE_LEN 4096
-#define MAX_OUT_LEN  128   /* generous cap for any profile output */
 
 static void fail(const char *msg) {
     fprintf(stderr, "STATUS:FAILURE\nERROR:%s\n", msg);
@@ -90,9 +89,9 @@ int main(void) {
     else if (strcmp(algo_str, "ARGON2ID_32") == 0) algo = DKGEN_ALGO_ARGON2ID_32;
     else { fail("Unsupported algorithm profile"); goto cleanup; }
 
-    /* Caller-provided output buffers with in/out capacities. */
-    uint8_t priv_out[MAX_OUT_LEN] = {0};
-    uint8_t pub_out[MAX_OUT_LEN]  = {0};
+    /* Caller-provided output buffers sized with public header macros. */
+    uint8_t priv_out[DKGEN_MAX_PRIV_LEN] = {0};
+    uint8_t pub_out[DKGEN_MAX_PUB_LEN]   = {0};
     size_t  priv_len = sizeof(priv_out);
     size_t  pub_len  = sizeof(pub_out);
 
@@ -107,16 +106,7 @@ int main(void) {
         pub_out,  &pub_len);
 
     if (res != DKGEN_OK) {
-        const char *msg;
-        switch (res) {
-            case DKGEN_ERR_INVALID_ARG:      msg = "Invalid argument";        break;
-            case DKGEN_ERR_UNKNOWN_ALGO:     msg = "Unknown algorithm";       break;
-            case DKGEN_ERR_BUFFER_TOO_SMALL: msg = "Output buffer too small"; break;
-            case DKGEN_ERR_DERIVE:           msg = "Derivation failed";       break;
-            case DKGEN_ERR_INTERNAL:         msg = "Internal error";          break;
-            default:                         msg = "Unknown error";           break;
-        }
-        fail(msg);
+        fail(dkgen_strerror(res));
         goto cleanup;
     }
 
